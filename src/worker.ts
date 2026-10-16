@@ -8091,12 +8091,17 @@ function getEffectiveDirectPullRequestGateCondition(
   remoteCondition: Exclude<EffectiveDirectPullRequestGateCondition, 'trusted_comment'>;
 } {
   const baseCondition = getEffectivePullRequestActionCondition(pullRequest);
+  // A merge state that only waits on pending CI or a required human review gives the author
+  // nothing to do, so it must not hand the issue to the follow-through owner.
   const remoteCondition: Exclude<EffectiveDirectPullRequestGateCondition, 'trusted_comment'> =
     baseCondition === 'conflict' || baseCondition === 'ci_failed' || baseCondition === 'review_actionable'
       ? baseCondition
-      : isGitHubPullRequestActionRequiredForSync(pullRequest)
-        ? 'action_required'
-        : baseCondition;
+      : isGitHubPullRequestPendingExternalWaitForSync(pullRequest)
+        || isGitHubPullRequestRequiredReviewWaitForSync(pullRequest)
+        ? 'waiting'
+        : isGitHubPullRequestActionRequiredForSync(pullRequest)
+          ? 'action_required'
+          : baseCondition;
   return {
     condition: hasTrustedPullRequestComment && (remoteCondition === 'ready' || remoteCondition === 'waiting')
       ? 'trusted_comment'
@@ -9130,8 +9135,17 @@ function resolvePaperclipIssueStatus(params: {
       return hasExecutorHandoffTarget ? 'in_progress' : 'todo';
     }
     if (effectiveGate.condition === 'waiting') {
+      if (shouldPreserveBlockedExternalPullRequestWait({
+        currentStatus,
+        linkedPullRequests: [effectiveGate.pullRequest]
+      })) {
+        return 'blocked';
+      }
       return (currentStatus === 'done' || currentStatus === 'in_review')
-        && isGitHubPullRequestTransientUnknownMergeabilityWait(effectiveGate.pullRequest)
+        && (
+          isGitHubPullRequestTransientUnknownMergeabilityWait(effectiveGate.pullRequest)
+          || isGitHubPullRequestRequiredReviewWaitForSync(effectiveGate.pullRequest)
+        )
         ? 'in_review'
         : 'in_progress';
     }
@@ -9200,8 +9214,17 @@ function resolvePaperclipDirectPullRequestIssueStatus(params: {
       return hasExecutorHandoffTarget ? 'in_progress' : 'todo';
     }
     if (effectiveGate.condition === 'waiting') {
+      if (shouldPreserveBlockedExternalPullRequestWait({
+        currentStatus,
+        linkedPullRequests: [effectiveGate.pullRequest]
+      })) {
+        return 'blocked';
+      }
       return (currentStatus === 'done' || currentStatus === 'in_review')
-        && isGitHubPullRequestTransientUnknownMergeabilityWait(effectiveGate.pullRequest)
+        && (
+          isGitHubPullRequestTransientUnknownMergeabilityWait(effectiveGate.pullRequest)
+          || isGitHubPullRequestRequiredReviewWaitForSync(effectiveGate.pullRequest)
+        )
         ? 'in_review'
         : 'in_progress';
     }
@@ -9456,6 +9479,17 @@ function isGitHubPullRequestBlockedMaintainerApprovalWaitForSync(
     && pullRequest.mergeability !== 'conflicting'
     && pullRequest.mergeStateStatus === 'blocked'
     && (pullRequest.reviewDecision === 'unknown' || pullRequest.reviewDecision === 'review_required');
+}
+
+/**
+ * GitHub reports a null review decision when branch protection requires no review, so only
+ * `REVIEW_REQUIRED` shows that a `BLOCKED` merge state waits on a human reviewer.
+ */
+function isGitHubPullRequestRequiredReviewWaitForSync(
+  pullRequest: Pick<GitHubPullRequestStatusSnapshot, 'ciState' | 'hasUnresolvedReviewThreads' | 'mergeability' | 'mergeStateStatus' | 'reviewDecision'>
+): boolean {
+  return pullRequest.reviewDecision === 'review_required'
+    && isGitHubPullRequestBlockedMaintainerApprovalWaitForSync(pullRequest);
 }
 
 /**
