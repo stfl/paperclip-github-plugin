@@ -10486,12 +10486,14 @@ async function hasTrustedGitHubCommentRecords(params: {
   maintainerCache: Map<string, boolean>;
 }): Promise<boolean> {
   const originalPosterLogin = normalizeGitHubUserLogin(params.originalPosterLogin);
-  const ignoredAuthorLogin = normalizeGitHubUserLogin(params.ignoredAuthorLogin);
+  // The ignored author comes from GraphQL, which names a GitHub App's bot `<slug>` where REST
+  // comment authors read `<slug>[bot]`.
+  const ignoredAuthorLogins = new Set(buildGitHubUsernameAliases(params.ignoredAuthorLogin));
   const unseenAuthors = new Set<string>();
 
   for (const comment of params.comments) {
     const authorLogin = normalizeGitHubUserLogin(comment.authorLogin);
-    if (!authorLogin || authorLogin === ignoredAuthorLogin) {
+    if (!authorLogin || ignoredAuthorLogins.has(authorLogin)) {
       continue;
     }
 

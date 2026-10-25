@@ -11141,16 +11141,30 @@ test('sync.runNow leaves a change request the author answered with the ticket ho
     [['reviewer', '2026-10-16T08:00:00Z'], ['engineer-bot', '2026-10-16T09:05:00Z']]
   ];
   const answered: ReplyState = { threads: answeredThreads, reviews: [changeRequest], checkConclusion: 'SUCCESS' };
+  type ScenarioPass = {
+    state: ReplyState;
+    handBack?: boolean;
+    expectedStatus: string;
+    expectedAssignee: string;
+    expectedWakes: number;
+  };
+  // The author's replies raise the review-comment count; as answers they must not re-arm the work.
+  const authorReplyPasses: ScenarioPass[] = [
+    {
+      state: { ...answered, threads: answeredThreads.map((comments) => comments.slice(0, 1)) },
+      expectedStatus: 'in_progress',
+      expectedAssignee: 'engineer-agent',
+      expectedWakes: 1
+    },
+    { state: answered, handBack: true, expectedStatus: 'in_review', expectedAssignee: 'po-agent', expectedWakes: 1 },
+    { state: answered, expectedStatus: 'in_review', expectedAssignee: 'po-agent', expectedWakes: 1 }
+  ];
   const scenarios: Array<{
     name: string;
     pullRequestNumber: number;
-    passes: Array<{
-      state: ReplyState;
-      handBack?: boolean;
-      expectedStatus: string;
-      expectedAssignee: string;
-      expectedWakes: number;
-    }>;
+    // REST names a GitHub App's bot `<slug>[bot]` where GraphQL names it `<slug>`.
+    authorIsApp?: boolean;
+    passes: ScenarioPass[];
   }> = [
     {
       name: 'answered threads waiting on the reviewer',
@@ -11193,19 +11207,15 @@ test('sync.runNow leaves a change request the author answered with the ticket ho
       }]
     },
     {
-      // The author's replies raise the review-comment count; as answers they must not re-arm the work.
       name: 'author replies after being woken for the change request',
       pullRequestNumber: 515,
-      passes: [
-        {
-          state: { ...answered, threads: answeredThreads.map((comments) => comments.slice(0, 1)) },
-          expectedStatus: 'in_progress',
-          expectedAssignee: 'engineer-agent',
-          expectedWakes: 1
-        },
-        { state: answered, handBack: true, expectedStatus: 'in_review', expectedAssignee: 'po-agent', expectedWakes: 1 },
-        { state: answered, expectedStatus: 'in_review', expectedAssignee: 'po-agent', expectedWakes: 1 }
-      ]
+      passes: authorReplyPasses
+    },
+    {
+      name: 'GitHub App author replies after being woken for the change request',
+      pullRequestNumber: 516,
+      authorIsApp: true,
+      passes: authorReplyPasses
     },
     {
       name: 'red CI with answered threads',
@@ -11246,6 +11256,7 @@ test('sync.runNow leaves a change request the author answered with the ticket ho
       followThroughAssigneeAgentId: 'engineer-agent'
     });
     let replyState = scenario.passes[0]!.state;
+    const restLogin = (login: string) => scenario.authorIsApp && login === 'engineer-bot' ? 'engineer-bot[bot]' : login;
 
     globalThis.fetch = async (input, init) => {
       const requestUrl = getRequestUrl(input);
@@ -11259,7 +11270,7 @@ test('sync.runNow leaves a change request the author answered with the ticket ho
           html_url: `https://github.com/paperclipai/example-repo/pull/${pullRequestNumber}`,
           state: 'open',
           merged: false,
-          user: { login: 'engineer-bot' },
+          user: { login: restLogin('engineer-bot') },
           comments: 0,
           review_comments: replyState.threads.flat().length
         });
@@ -11271,7 +11282,7 @@ test('sync.runNow leaves a change request the author answered with the ticket ho
             .flatMap((comments, index) => comments.map(([login, createdAt], commentIndex) => ({
               id: index * 100 + commentIndex + 1,
               body: `Comment ${commentIndex} on thread ${index}`,
-              user: { login },
+              user: { login: restLogin(login) },
               author_association: login === 'reviewer' ? 'MEMBER' : 'COLLABORATOR',
               created_at: createdAt,
               updated_at: createdAt
