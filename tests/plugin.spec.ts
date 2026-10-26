@@ -10799,6 +10799,110 @@ test('sync.runNow keeps a direct pull request link that answers 404 when listing
   }
 });
 
+test('sync.runNow re-arms a deliberately blocked direct PR issue for a maintainer comment on any linked PR, not for the PR author', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  harness.ctx.agents.get = async (agentId, companyId) =>
+    agentId === 'owner-50' && companyId === 'company-1'
+      ? { id: agentId, companyId, name: agentId } as never
+      : null;
+  const pullRequestComments = new Map<number, Array<{ id: number; body: string; user: { login: string }; author_association: string }>>([
+    [50, []],
+    [51, []]
+  ]);
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Deliberately blocked direct PR',
+    description: 'A required check is red for a reason the assignee cannot clear.'
+  });
+
+  await upsertDirectPullRequestLink(harness, issue.id, 50, {
+    title: 'Red CI PR',
+    followThroughAssigneeAgentId: 'owner-50'
+  });
+  await upsertDirectPullRequestLink(harness, issue.id, 51, { title: 'Waiting PR' });
+  await harness.ctx.issues.update(issue.id, { status: 'blocked' }, 'company-1');
+
+  const buildStatusContexts = (number: number) => ({
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: number === 50 ? 'FAILURE' : 'SUCCESS' }]
+  });
+  const buildPullRequestStatus = (number: number) => ({
+    headRefOid: String(number).repeat(20),
+    mergeable: 'MERGEABLE',
+    mergeStateStatus: 'BLOCKED',
+    reviewDecision: 'REVIEW_REQUIRED',
+    statusCheckRollup: { contexts: buildStatusContexts(number) }
+  });
+  globalThis.fetch = async (input, init) => {
+    const requestPathname = getDecodedRequestPathname(input);
+    const pullRequestMatch = /^\/repos\/paperclipai\/example-repo\/pulls\/(50|51)$/.exec(requestPathname);
+    if (pullRequestMatch) {
+      const number = Number(pullRequestMatch[1]);
+      return jsonResponse({
+        number,
+        title: number === 50 ? 'Red CI PR' : 'Waiting PR',
+        html_url: `https://github.com/paperclipai/example-repo/pull/${number}`,
+        state: 'open',
+        merged: false,
+        comments: pullRequestComments.get(number)!.length,
+        review_comments: 0,
+        user: { login: 'pr-author' }
+      });
+    }
+
+    const commentsMatch = /^\/repos\/paperclipai\/example-repo\/issues\/(50|51)\/comments$/.exec(requestPathname);
+    if (commentsMatch) {
+      return jsonResponse(pullRequestComments.get(Number(commentsMatch[1])));
+    }
+
+    if (requestPathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const pullRequestNumber = typeof variables.pullRequestNumber === 'number' ? variables.pullRequestNumber : 0;
+      if (query.includes('query GitHubRepositoryOpenPullRequestStatuses')) {
+        return graphqlResponse({ repository: { pullRequests: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [50, 51].map((number) => ({
+            number,
+            ...buildPullRequestStatus(number),
+            reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+          }))
+        } } });
+      }
+      if (query.includes('query GitHubPullRequestReviewThreads') && [50, 51].includes(pullRequestNumber)) {
+        return graphqlResponse({ repository: { pullRequest: { reviewThreads: {
+          pageInfo: { hasNextPage: false, endCursor: null }, nodes: []
+        } } } });
+      }
+      if (query.includes('query GitHubPullRequestCiContexts') && [50, 51].includes(pullRequestNumber)) {
+        return graphqlResponse({ repository: { pullRequest: buildPullRequestStatus(pullRequestNumber) } });
+      }
+    }
+
+    throw new Error(`Unexpected fetch during blocked direct PR comment test: ${getRequestUrl(input)}`);
+  };
+  const syncIssue = async () => {
+    await harness.performAction('sync.runNow', { companyId: 'company-1', issueId: issue.id, waitForCompletion: true });
+    return (await harness.ctx.issues.get(issue.id, 'company-1'))?.status;
+  };
+
+  try {
+    assert.equal(await syncIssue(), 'in_progress');
+
+    await harness.ctx.issues.update(issue.id, { status: 'blocked' }, 'company-1');
+    assert.equal(await syncIssue(), 'blocked');
+
+    pullRequestComments.get(50)!.push({ id: 5001, body: 'Still blocked on the red check.', user: { login: 'pr-author' }, author_association: 'COLLABORATOR' });
+    assert.equal(await syncIssue(), 'blocked', "the PR author's own comment must not re-open the deliberate block");
+
+    pullRequestComments.get(51)!.push({ id: 5101, body: 'The check is fixed upstream, retry.', user: { login: 'repo-maintainer' }, author_association: 'MEMBER' });
+    assert.equal(await syncIssue(), 'in_progress', "a maintainer's comment on the other linked PR re-arms the deliberately blocked issue");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('sync.runNow pauses on a rate limit while checking a direct pull request link that answers 404', async () => {
   const harness = await createProjectPullRequestsHarness();
   const originalFetch = globalThis.fetch;
@@ -24164,6 +24268,107 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     assert.equal(statusMutations.length, 0);
     assert.equal(transitionComments.length, 0);
     assert.equal(wakeRequests.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('sync.runNow re-arms a deliberately blocked imported issue for a maintainer comment, not for the PR author', async () => {
+  const harness = createTestHarness({ manifest, config: { githubTokenRef: 'github-secret-ref' } });
+  await plugin.definition.setup(harness.ctx);
+  harness.seed({ agents: [createAgentFixture({
+    id: 'agent-blocked-executor', companyId: 'company-1', name: 'Blocked Executor', title: 'Executor'
+  })] });
+  await harness.performAction('settings.saveRegistration', {
+    companyId: 'company-1',
+    mappings: [{
+      id: 'mapping-blocked', repositoryUrl: 'paperclipai/example-repo',
+      paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId: 'company-1'
+    }],
+    advancedSettings: { executorAssigneeAgentId: 'agent-blocked-executor', defaultStatus: 'backlog' },
+    syncState: { status: 'idle' }
+  });
+
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1', projectId: 'project-1', title: 'Deliberately blocked imported issue', status: 'blocked'
+  });
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' },
+    [{
+      mappingId: 'mapping-blocked', githubIssueId: 7101, githubIssueNumber: 71,
+      paperclipIssueId: issue.id, importedAt: '2026-06-01T09:00:00.000Z', lastSeenCommentCount: 0,
+      lastSeenGitHubState: 'open', repositoryUrl: 'https://github.com/paperclipai/example-repo',
+      paperclipProjectId: 'project-1', companyId: 'company-1'
+    }]
+  );
+
+  const issueComments: Array<{ id: number; body: string; user: { login: string }; author_association: string }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse([{
+        id: 7101, number: 71, title: 'Deliberately blocked imported issue', body: null,
+        html_url: 'https://github.com/paperclipai/example-repo/issues/71', state: 'open',
+        comments: issueComments.length, user: { login: 'issue-author' }
+      }]);
+    }
+    if (url.pathname === '/repos/paperclipai/example-repo/issues/71/comments') {
+      return jsonResponse(issueComments);
+    }
+    if (url.pathname === '/repos/paperclipai/example-repo/pulls/710') {
+      return jsonResponse({
+        number: 710, title: 'Conflicting PR', html_url: 'https://github.com/paperclipai/example-repo/pull/710',
+        state: 'open', merged: false, comments: 0, review_comments: 0, user: { login: 'pr-author' }
+      });
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([{ issueNumber: 71 }]);
+      }
+      if (query.includes('query GitHubIssueStatusSnapshot')) {
+        return graphqlResponse({ repository: { issue: {
+          number: 71, state: 'OPEN', stateReason: null, comments: { totalCount: issueComments.length },
+          closedByPullRequestsReferences: {
+            pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ number: 710, state: 'OPEN' }]
+          }
+        } } });
+      }
+      if (query.includes('query GitHubPullRequestReviewThreads')) {
+        return graphqlResponse({ repository: { pullRequest: { reviewThreads: {
+          pageInfo: { hasNextPage: false, endCursor: null }, nodes: []
+        } } } });
+      }
+      if (query.includes('query GitHubPullRequestCiContexts')) {
+        return graphqlResponse({ repository: { pullRequest: {
+          headRefOid: 'a'.repeat(40), mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY',
+          reviewDecision: 'REVIEW_REQUIRED',
+          statusCheckRollup: { contexts: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }]
+          } }
+        } } });
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+  const syncIssue = async () => {
+    await harness.performAction('sync.runNow', {});
+    return (await harness.ctx.issues.get(issue.id, 'company-1'))?.status;
+  };
+
+  try {
+    assert.equal(await syncIssue(), 'in_progress');
+
+    await harness.ctx.issues.update(issue.id, { status: 'blocked' }, 'company-1');
+    assert.equal(await syncIssue(), 'blocked');
+
+    issueComments.push({ id: 7001, body: 'Still blocked on the conflict.', user: { login: 'pr-author' }, author_association: 'COLLABORATOR' });
+    assert.equal(await syncIssue(), 'blocked', "the PR author's own comment must not re-open the deliberate block");
+
+    issueComments.push({ id: 7002, body: 'Resolved upstream, retry.', user: { login: 'repo-maintainer' }, author_association: 'MEMBER' });
+    assert.equal(await syncIssue(), 'in_progress', "a maintainer's comment re-arms the deliberately blocked issue");
   } finally {
     globalThis.fetch = originalFetch;
   }

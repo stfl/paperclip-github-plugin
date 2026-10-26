@@ -10494,13 +10494,13 @@ async function hasTrustedGitHubCommentRecords(params: {
   repository: ParsedRepositoryReference;
   comments: GitHubIssueCommentRecord[];
   originalPosterLogin?: string;
-  ignoredAuthorLogin?: string;
+  ignoredAuthorLogins?: Array<string | undefined>;
   maintainerCache: Map<string, boolean>;
 }): Promise<boolean> {
   const originalPosterLogin = normalizeGitHubUserLogin(params.originalPosterLogin);
-  // The ignored author comes from GraphQL, which names a GitHub App's bot `<slug>` where REST
+  // An ignored author can come from GraphQL, which names a GitHub App's bot `<slug>` where REST
   // comment authors read `<slug>[bot]`.
-  const ignoredAuthorLogins = new Set(buildGitHubUsernameAliases(params.ignoredAuthorLogin));
+  const ignoredAuthorLogins = new Set((params.ignoredAuthorLogins ?? []).flatMap(buildGitHubUsernameAliases));
   const unseenAuthors = new Set<string>();
 
   for (const comment of params.comments) {
@@ -10646,6 +10646,7 @@ async function listTrustedNewLinkedPullRequestCommentSources(params: {
   previousCommentCounts?: GitHubPullRequestCommentCountRecord[];
   currentCommentCounts: GitHubPullRequestCommentCountRecord[];
   reviewAnswerAuthorLogins?: Map<string, string>;
+  ignoredAuthorLogins?: Array<string | undefined>;
   maintainerCache: Map<string, boolean>;
 }): Promise<GitHubTrustedPullRequestCommentSource[]> {
   if ((params.currentCommentCounts?.length ?? 0) === 0 || (params.previousCommentCounts?.length ?? 0) === 0) {
@@ -10665,7 +10666,10 @@ async function listTrustedNewLinkedPullRequestCommentSources(params: {
 
     const pullRequestRepository = requireRepositoryReference(currentCommentCount.repositoryUrl);
     const repositoryUrl = getNormalizedMappingRepositoryUrl({ repositoryUrl: currentCommentCount.repositoryUrl });
-    const ignoredAuthorLogin = params.reviewAnswerAuthorLogins?.get(buildGitHubPullRequestReferenceKey(currentCommentCount));
+    const ignoredAuthorLogins = [
+      ...(params.ignoredAuthorLogins ?? []),
+      params.reviewAnswerAuthorLogins?.get(buildGitHubPullRequestReferenceKey(currentCommentCount))
+    ];
 
     if (currentCommentCount.topLevelCommentCount > previousCommentCount.topLevelCommentCount) {
       const newTopLevelComments = await listNewGitHubIssueCommentsSinceCount(
@@ -10680,7 +10684,7 @@ async function listTrustedNewLinkedPullRequestCommentSources(params: {
         repository: pullRequestRepository,
         comments: newTopLevelComments,
         originalPosterLogin: params.originalPosterLogin,
-        ignoredAuthorLogin,
+        ignoredAuthorLogins,
         maintainerCache: params.maintainerCache
       })) {
         sources.push({ repositoryUrl, number: currentCommentCount.number, kind: 'top_level' });
@@ -10700,7 +10704,7 @@ async function listTrustedNewLinkedPullRequestCommentSources(params: {
         repository: pullRequestRepository,
         comments: newReviewComments,
         originalPosterLogin: params.originalPosterLogin,
-        ignoredAuthorLogin,
+        ignoredAuthorLogins,
         maintainerCache: params.maintainerCache
       })) {
         sources.push({ repositoryUrl, number: currentCommentCount.number, kind: 'review' });
@@ -10712,6 +10716,76 @@ async function listTrustedNewLinkedPullRequestCommentSources(params: {
     buildGitHubPullRequestReferenceKey(left).localeCompare(buildGitHubPullRequestReferenceKey(right))
     || left.kind.localeCompare(right.kind)
   );
+}
+
+/**
+ * Whether a repository maintainer who authored none of the linked pull requests commented since
+ * the recorded watermarks. A deliberately blocked issue stays blocked against the pull request
+ * author's own comments, which are the assignee restating the block, but not against a maintainer.
+ */
+async function hasNewMaintainerComment(params: {
+  octokit: Octokit;
+  githubIssue?: {
+    repository: ParsedRepositoryReference;
+    number: number;
+    previousCommentCount?: number;
+    currentCommentCount: number;
+  };
+  previousPullRequestCommentCounts?: GitHubPullRequestCommentCountRecord[];
+  currentPullRequestCommentCounts: GitHubPullRequestCommentCountRecord[];
+  pullRequestAuthorLogins: Array<string | undefined>;
+  maintainerCache: Map<string, boolean>;
+}): Promise<boolean> {
+  const { githubIssue } = params;
+  if (
+    githubIssue
+    && githubIssue.previousCommentCount !== undefined
+    && githubIssue.currentCommentCount > githubIssue.previousCommentCount
+    && await hasTrustedGitHubCommentRecords({
+      octokit: params.octokit,
+      repository: githubIssue.repository,
+      comments: await listNewGitHubIssueCommentsSinceCount(
+        params.octokit,
+        githubIssue.repository,
+        githubIssue.number,
+        githubIssue.previousCommentCount,
+        githubIssue.currentCommentCount
+      ),
+      ignoredAuthorLogins: params.pullRequestAuthorLogins,
+      maintainerCache: params.maintainerCache
+    })
+  ) {
+    return true;
+  }
+
+  return (await listTrustedNewLinkedPullRequestCommentSources({
+    octokit: params.octokit,
+    previousCommentCounts: params.previousPullRequestCommentCounts,
+    currentCommentCounts: params.currentPullRequestCommentCounts,
+    ignoredAuthorLogins: params.pullRequestAuthorLogins,
+    maintainerCache: params.maintainerCache
+  })).length > 0;
+}
+
+async function listGitHubPullRequestAuthorLogins(
+  octokit: Octokit,
+  pullRequests: GitHubPullRequestReference[]
+): Promise<Array<string | undefined>> {
+  const authorLogins: Array<string | undefined> = [];
+  for (const pullRequest of pullRequests) {
+    const repository = requireRepositoryReference(pullRequest.repositoryUrl);
+    const response = await octokit.rest.pulls.get({
+      owner: repository.owner,
+      repo: repository.repo,
+      pull_number: pullRequest.number,
+      headers: {
+        'X-GitHub-Api-Version': GITHUB_API_VERSION
+      }
+    });
+    authorLogins.push(response.data.user?.login);
+  }
+
+  return authorLogins;
 }
 
 async function isMaintainerAuthoredGitHubIssue(params: {
@@ -15905,12 +15979,27 @@ async function synchronizePaperclipIssueStatuses(
       }
       const currentExternalStateHash = buildExternalPullRequestStateHash(snapshot.linkedPullRequests);
       const previousUnblockedExternalStateHash = importedIssue.unblockedExternalStateHash;
-      if (shouldPreserveDeliberateBlockedWait({
-        currentStatus: paperclipIssue.status,
-        nextStatus,
-        currentExternalStateHash,
-        unblockedExternalStateHash: previousUnblockedExternalStateHash
-      })) {
+      if (
+        shouldPreserveDeliberateBlockedWait({
+          currentStatus: paperclipIssue.status,
+          nextStatus,
+          currentExternalStateHash,
+          unblockedExternalStateHash: previousUnblockedExternalStateHash
+        })
+        && !(hasTrustedNewComment && await hasNewMaintainerComment({
+          octokit,
+          githubIssue: {
+            repository,
+            number: githubIssue.number,
+            previousCommentCount,
+            currentCommentCount: snapshot.commentCount
+          },
+          previousPullRequestCommentCounts: importedIssue.linkedPullRequestCommentCounts,
+          currentPullRequestCommentCounts: currentLinkedPullRequestCommentCounts,
+          pullRequestAuthorLogins: await listGitHubPullRequestAuthorLogins(octokit, snapshot.linkedPullRequests),
+          maintainerCache: repositoryMaintainerCache
+        }))
+      ) {
         nextStatus = 'blocked';
       }
       const nextUnblockedExternalStateHash = resolveUnblockedExternalStateHash({
@@ -16471,8 +16560,8 @@ async function synchronizePaperclipPullRequestIssueStatuses(
         .map((snapshot) => snapshot.commentCounts)
         .filter((counts): counts is GitHubPullRequestCommentCountRecord => Boolean(counts));
       const trustedCommentSources: GitHubTrustedPullRequestCommentSource[] = [];
+      const maintainerCache = new Map<string, boolean>();
       if (paperclipIssue.status !== 'backlog' && remoteAction.linkedPullRequestCommentCounts) {
-        const maintainerCache = new Map<string, boolean>();
         for (const snapshot of pullRequestSnapshots) {
           if (!snapshot.commentCounts) continue;
           trustedCommentSources.push(...await listTrustedNewLinkedPullRequestCommentSources({
@@ -16566,12 +16655,21 @@ async function synchronizePaperclipPullRequestIssueStatuses(
           .filter((pullRequest): pullRequest is GitHubPullRequestStatusSnapshot => Boolean(pullRequest))
       );
       const previousUnblockedExternalStateHash = remoteAction.unblockedExternalStateHash;
-      if (shouldPreserveDeliberateBlockedWait({
-        currentStatus: paperclipIssue.status,
-        nextStatus,
-        currentExternalStateHash,
-        unblockedExternalStateHash: previousUnblockedExternalStateHash
-      })) {
+      if (
+        shouldPreserveDeliberateBlockedWait({
+          currentStatus: paperclipIssue.status,
+          nextStatus,
+          currentExternalStateHash,
+          unblockedExternalStateHash: previousUnblockedExternalStateHash
+        })
+        && !(trustedCommentSources.length > 0 && await hasNewMaintainerComment({
+          octokit,
+          previousPullRequestCommentCounts: remoteAction.linkedPullRequestCommentCounts,
+          currentPullRequestCommentCounts: currentCommentCounts,
+          pullRequestAuthorLogins: pullRequestSnapshots.map((snapshot) => snapshot.authorLogin),
+          maintainerCache
+        }))
+      ) {
         nextStatus = 'blocked';
       }
       const nextUnblockedExternalStateHash = resolveUnblockedExternalStateHash({
