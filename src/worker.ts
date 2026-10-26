@@ -7110,6 +7110,7 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
           : undefined;
       const selectedPullRequestGate = normalizeSelectedPullRequestGate(record.selectedPullRequestGate);
       const pendingRemoteActionWake = normalizePendingRemoteActionWake(record.pendingRemoteActionWake);
+      const unblockedExternalStateHash = normalizeExternalPullRequestStateHash(record.unblockedExternalStateHash);
       const activationPending = record.activationPending === true;
 
       if (!mappingId || Number.isNaN(githubIssueId) || !paperclipIssueId || !importedAt) {
@@ -7131,10 +7132,15 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
         ...(remoteActionFingerprint ? { remoteActionFingerprint } : {}),
         ...(selectedPullRequestGate ? { selectedPullRequestGate } : {}),
         ...(pendingRemoteActionWake ? { pendingRemoteActionWake } : {}),
+        ...(unblockedExternalStateHash ? { unblockedExternalStateHash } : {}),
         ...(activationPending ? { activationPending: true } : {})
       };
     })
     .filter((entry): entry is ImportedIssueRecord => entry !== null);
+}
+
+function normalizeExternalPullRequestStateHash(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : undefined;
 }
 
 function normalizePendingRemoteActionWake(value: unknown): PendingRemoteActionWake | undefined {
@@ -7175,6 +7181,7 @@ function normalizeRemoteActionRegistry(value: unknown): RemoteActionRecord[] {
       record.linkedPullRequestCommentCounts
     );
     const selectedPullRequestGate = normalizeSelectedPullRequestGate(record.selectedPullRequestGate);
+    const unblockedExternalStateHash = normalizeExternalPullRequestStateHash(record.unblockedExternalStateHash);
     const previous = recordsByKey.get(key);
     recordsByKey.set(key, {
       key,
@@ -7189,6 +7196,11 @@ function normalizeRemoteActionRegistry(value: unknown): RemoteActionRecord[] {
         ? { selectedPullRequestGate }
         : previous?.selectedPullRequestGate
           ? { selectedPullRequestGate: previous.selectedPullRequestGate }
+          : {}),
+      ...(unblockedExternalStateHash
+        ? { unblockedExternalStateHash }
+        : previous?.unblockedExternalStateHash
+          ? { unblockedExternalStateHash: previous.unblockedExternalStateHash }
           : {})
     });
   }

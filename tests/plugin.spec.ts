@@ -23885,7 +23885,16 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     }) as Array<{ remoteActionFingerprint?: string }>;
     assert.match(registryAfterFirstAction[0]?.remoteActionFingerprint ?? '', /^[a-f0-9]{64}$/);
 
+    // Re-blocking on unchanged PR state is a deliberate decision, not drift: sync holds it.
     await acknowledgeAndReset();
+    const heldBlock = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+    assert.equal(heldBlock.syncState.status, 'success');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    assert.equal(transitionComments.length, 0);
+    assert.equal(statusMutations.length, 0);
+    assert.equal(wakeRequests.length, 0);
+
+    await acknowledgeAndReset('in_review');
     await syncAndExpectWake();
 
     transitionComments.length = 0;
@@ -24271,6 +24280,44 @@ test('import registry normalization discards malformed legacy remote action stat
 
   assert.equal(record?.remoteActionFingerprint, undefined);
   assert.equal(record?.pendingRemoteActionWake, undefined);
+});
+
+test('registry normalization keeps the external PR state sync last unblocked on across loads', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const testing = workerModule.__testing as typeof workerModule.__testing & {
+    normalizeImportRegistry?: (value: unknown) => Array<Record<string, unknown>>;
+    normalizeRemoteActionRegistry?: (value: unknown) => Array<Record<string, unknown>>;
+  };
+  const stateHash = 'e'.repeat(64);
+
+  const [importedIssue, malformedImportedIssue] = testing.normalizeImportRegistry!([
+    {
+      mappingId: 'mapping-a',
+      githubIssueId: 11,
+      paperclipIssueId: 'issue-blocked',
+      importedAt: '2026-01-01T00:00:00.000Z',
+      unblockedExternalStateHash: stateHash
+    },
+    {
+      mappingId: 'mapping-a',
+      githubIssueId: 12,
+      paperclipIssueId: 'issue-malformed',
+      importedAt: '2026-01-01T00:00:00.000Z',
+      unblockedExternalStateHash: 'not-a-digest'
+    }
+  ]);
+  assert.equal(importedIssue?.unblockedExternalStateHash, stateHash);
+  assert.equal(malformedImportedIssue?.unblockedExternalStateHash, undefined);
+
+  const remoteActions = testing.normalizeRemoteActionRegistry!([
+    { key: 'direct-pr:company-1:issue-blocked', unblockedExternalStateHash: stateHash },
+    { key: 'direct-pr:company-1:issue-blocked' },
+    { key: 'direct-pr:company-1:issue-malformed', unblockedExternalStateHash: 'not-a-digest' }
+  ]);
+  assert.deepEqual(remoteActions, [
+    { key: 'direct-pr:company-1:issue-blocked', unblockedExternalStateHash: stateHash },
+    { key: 'direct-pr:company-1:issue-malformed' }
+  ]);
 });
 
 test('worker routes sync-driven review handoffs to execution-policy assignees and wakes those agents', async () => {
