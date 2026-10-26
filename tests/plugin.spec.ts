@@ -10663,6 +10663,178 @@ test('sync.runNow cancels directly linked pull request issues when every linked 
   }
 });
 
+function createHiddenDirectPullRequestFetch(options: {
+  pullRequestList: 'ok' | 'not-found' | 'rate-limited';
+  requestedPathnames: string[];
+}) {
+  return async (input: unknown, init?: RequestInit): Promise<Response> => {
+    const requestPathname = getDecodedRequestPathname(input);
+    options.requestedPathnames.push(requestPathname);
+
+    if (requestPathname === '/repos/paperclipai/example-repo/pulls/48') {
+      return jsonResponse({ message: 'Not Found' }, 404);
+    }
+
+    if (requestPathname === '/repos/paperclipai/example-repo/pulls') {
+      return options.pullRequestList === 'ok'
+        ? jsonResponse([])
+        : options.pullRequestList === 'rate-limited'
+          ? githubRateLimitedResponse()
+          : jsonResponse({ message: 'Not Found' }, 404);
+    }
+
+    if (requestPathname === '/repos/paperclipai/example-repo/pulls/49') {
+      return jsonResponse({
+        number: 49,
+        title: 'Merged direct PR link',
+        html_url: 'https://github.com/paperclipai/example-repo/pull/49',
+        state: 'closed',
+        merged: true
+      });
+    }
+
+    if (requestPathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubRepositoryOpenPullRequestStatuses')) {
+        return graphqlResponse({
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: []
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected fetch during hidden direct PR sync test: ${getRequestUrl(input)}`);
+  };
+}
+
+test('sync.runNow drops a direct pull request link whose pull request answers 404 in a repository whose pull requests it can list', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const requestedPathnames: string[] = [];
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Hidden direct PR link',
+    description: 'One linked PR is hidden from the token; the other merged.'
+  });
+
+  await upsertDirectPullRequestLink(harness, issue.id, 48, { title: 'Hidden direct PR link' });
+  await upsertDirectPullRequestLink(harness, issue.id, 49, { title: 'Merged direct PR link' });
+  await harness.ctx.issues.update(issue.id, { status: 'in_review' }, 'company-1');
+  globalThis.fetch = createHiddenDirectPullRequestFetch({ pullRequestList: 'ok', requestedPathnames });
+
+  try {
+    const sync = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      waitForCompletion: true
+    }) as { syncState: { status: string } };
+
+    assert.equal(sync.syncState.status, 'success');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'done');
+    const pullRequestLinks = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: issue.id
+    });
+    assert.deepEqual(
+      pullRequestLinks
+        .map((link) => [(link.data as { githubPullRequestNumber?: number }).githubPullRequestNumber, link.status])
+        .sort(),
+      [[48, 'unlinked'], [49, 'closed']]
+    );
+
+    requestedPathnames.length = 0;
+    const nextSync = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      waitForCompletion: true
+    }) as { syncState: { status: string } };
+    assert.equal(nextSync.syncState.status, 'success');
+    assert.ok(!requestedPathnames.includes('/repos/paperclipai/example-repo/pulls/48'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('sync.runNow keeps a direct pull request link that answers 404 when listing the repository pull requests fails', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Direct PR link in a repository the token lost',
+    description: 'A token without repository access answers 404 for every pull request.'
+  });
+
+  await upsertDirectPullRequestLink(harness, issue.id, 48, { title: 'Hidden direct PR link' });
+  await harness.ctx.issues.update(issue.id, { status: 'in_review' }, 'company-1');
+  globalThis.fetch = createHiddenDirectPullRequestFetch({ pullRequestList: 'not-found', requestedPathnames: [] });
+
+  try {
+    await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      waitForCompletion: true
+    });
+
+    const { syncState } = await harness.getData<{
+      syncState: { status?: string; recentFailures?: Array<{ rawMessage?: string }> };
+    }>('sync.toolbarState', { companyId: 'company-1' });
+    assert.equal(syncState.status, 'error');
+    assert.equal(syncState.recentFailures?.[0]?.rawMessage, 'Not Found');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'in_review');
+    const [pullRequestLink] = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: issue.id
+    });
+    assert.equal(pullRequestLink?.status, 'open');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('sync.runNow pauses on a rate limit while checking a direct pull request link that answers 404', async () => {
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Direct PR link checked under a rate limit',
+    description: 'The pull request listing that proves the 404 answers with a rate limit.'
+  });
+
+  await upsertDirectPullRequestLink(harness, issue.id, 48, { title: 'Hidden direct PR link' });
+  globalThis.fetch = createHiddenDirectPullRequestFetch({ pullRequestList: 'rate-limited', requestedPathnames: [] });
+
+  try {
+    await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      issueId: issue.id,
+      waitForCompletion: true
+    });
+
+    const { syncState } = await harness.getData<{
+      syncState: { status?: string; errorDetails?: { rateLimitResetAt?: string } };
+    }>('sync.toolbarState', { companyId: 'company-1' });
+    assert.equal(syncState.status, 'error');
+    assert.ok(syncState.errorDetails?.rateLimitResetAt);
+    const [pullRequestLink] = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: issue.id
+    });
+    assert.equal(pullRequestLink?.status, 'open');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('sync.runNow preserves and deduplicates durable direct-PR ownership across worker restart when another linked PR is merged', async () => {
   const harness = await createProjectPullRequestsHarness();
   const originalFetch = globalThis.fetch;

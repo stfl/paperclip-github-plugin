@@ -107,7 +107,7 @@ Manual GitHub issue links are added to the same import registry and issue-link e
 
 When a Paperclip issue is linked to a GitHub issue and also has older direct pull request links, the GitHub issue remains the status source of truth. Direct pull request links only drive status for PR-only Paperclip issues, which prevents stale merged PR metadata from closing work while the GitHub issue and its current linked PR are still open.
 
-Operators can unlink a linked Paperclip issue from the GitHub detail surface when they intentionally want GitHub Sync to stop updating it. Agent-facing tools can create durable issue and pull request links, but they do not expose an unlink operation; internal sync repair may still tombstone a link when GitHub transfers an issue to an unmapped repository.
+Operators can unlink a linked Paperclip issue from the GitHub detail surface when they intentionally want GitHub Sync to stop updating it. Agent-facing tools can create durable issue and pull request links, but they do not expose an unlink operation; internal sync repair may still tombstone a link when GitHub transfers an issue to an unmapped repository, or when a directly linked pull request answers 404 in a repository whose pull requests the token can list (GitHub hides the pull requests of a suspended account).
 
 ### Agent workflows built in
 

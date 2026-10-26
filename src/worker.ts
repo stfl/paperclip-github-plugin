@@ -16188,6 +16188,57 @@ async function synchronizePaperclipIssueStatuses(
   };
 }
 
+/**
+ * GitHub answers 404 for a pull request it hides (its author was suspended) or deleted, and also
+ * for every pull request of a repository the token cannot read. Only the first is a dead link, so a
+ * 404 counts as gone only while the token can list the repository's pull requests.
+ */
+async function isGitHubPullRequestGoneFromReadableRepository(
+  octokit: Octokit,
+  repository: ParsedRepositoryReference,
+  error: unknown
+): Promise<boolean> {
+  if (getErrorStatus(error) !== 404) {
+    return false;
+  }
+
+  try {
+    await octokit.rest.pulls.list({
+      owner: repository.owner,
+      repo: repository.repo,
+      per_page: 1,
+      headers: {
+        'X-GitHub-Api-Version': GITHUB_API_VERSION
+      }
+    });
+    return true;
+  } catch (probeError) {
+    if (isGitHubRateLimitError(probeError)) {
+      throw probeError;
+    }
+
+    return false;
+  }
+}
+
+async function dropGoneGitHubPullRequestLinkRecord(
+  ctx: PluginSetupContext,
+  record: GitHubPullRequestLinkRecord,
+  mapping: RepositoryMapping
+): Promise<void> {
+  await tombstoneGitHubPullRequestLinkRecord(ctx, record, new Date().toISOString());
+  invalidateGitHubLinkCachesForTarget({
+    companyId: record.data.companyId ?? mapping.companyId,
+    projectId: record.data.paperclipProjectId ?? mapping.paperclipProjectId,
+    repositoryUrl: record.data.repositoryUrl
+  });
+  ctx.logger.warn('GitHub Sync unlinked a pull request that GitHub hides or deleted.', {
+    paperclipIssueId: record.paperclipIssueId,
+    repositoryUrl: record.data.repositoryUrl,
+    pullRequestNumber: record.data.githubPullRequestNumber
+  });
+}
+
 function groupGitHubPullRequestLinksByPaperclipIssue(
   pullRequestLinks: GitHubPullRequestLinkRecord[]
 ): Map<string, GitHubPullRequestLinkRecord[]> {
@@ -16272,14 +16323,24 @@ async function synchronizePaperclipPullRequestIssueStatuses(
           repositoryUrl: pullRequestRepository.url,
           githubIssueNumber: undefined
         });
-        const pullRequestResponse = await octokit.rest.pulls.get({
-          owner: pullRequestRepository.owner,
-          repo: pullRequestRepository.repo,
-          pull_number: pullRequestLink.data.githubPullRequestNumber,
-          headers: {
-            'X-GitHub-Api-Version': GITHUB_API_VERSION
+        let pullRequestResponse: Awaited<ReturnType<typeof octokit.rest.pulls.get>>;
+        try {
+          pullRequestResponse = await octokit.rest.pulls.get({
+            owner: pullRequestRepository.owner,
+            repo: pullRequestRepository.repo,
+            pull_number: pullRequestLink.data.githubPullRequestNumber,
+            headers: {
+              'X-GitHub-Api-Version': GITHUB_API_VERSION
+            }
+          });
+        } catch (error) {
+          if (!await isGitHubPullRequestGoneFromReadableRepository(octokit, pullRequestRepository, error)) {
+            throw error;
           }
-        });
+
+          await dropGoneGitHubPullRequestLinkRecord(ctx, pullRequestLink, mapping);
+          continue;
+        }
         const livePullRequestLifecycleState = getPullRequestApiState({
           state: pullRequestResponse.data.state,
           merged: pullRequestResponse.data.merged
